@@ -23,6 +23,3 @@ Sistem ini menerapkan pendekatan **Multi-Layer Monitoring (10 Layers)** untuk me
 * **Database:** PostgreSQL (UUID-based relational tables)
 * **Layanan Eksternal:** Telegram API, SMTP Email, AI Chatbot Service
 
-## 📝 Kontribusi Saya (Risky Melisa Simanullang)
-Di dalam proyek tim ini, saya berfokus pada:
-* *[Silakan isi spesifik tugas Anda, contoh: Mengembangkan komponen Frontend dashboard menggunakan React & integrasi WebSocket Client / Merancang skema database PostgreSQL dan implementasi monitoring engine menggunakan Golang Goroutines]*

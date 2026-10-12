@@ -1,0 +1,26 @@
+# Arsitektur Sistem Monitoring
+
+```mermaid
+flowchart LR
+  subgraph Admin
+    A[Administrator] -->|Interaksi UI| FE[Frontend\n(React 18 + Vite + Tailwind)]
+  end
+
+  FE -->|REST API (Axios)| BE[Backend \n(Go, Chi/Gin)]
+  FE -->|WebSocket (WS)| WS[WebSocket Endpoint]
+
+  BE -->|Reads/Writes| DB[(PostgreSQL)]
+  BE -->|Publishes events| MQ[Alert System / Notification Service]
+  BE -->|Schedules/Triggers| ME[Monitoring Engine]
+
+  ME -->|Performs checks| Targets[Target Websites]
+  Targets -->|Responses| ME
+  ME -->|Writes results| DB
+  ME -->|Sends alerts| MQ
+  MQ -->|Sends email/telegram| External[Email / Telegram]
+  MQ -->|Notifies| BE
+  BE -->|Pushes realtime updates| WS
+  WS -->|Delivers messages| FE
+
+  click FE href "../src/App.jsx" "Open App.jsx"
+```

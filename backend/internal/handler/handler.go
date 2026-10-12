@@ -1,0 +1,665 @@
+package handler
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/spmt/monitoring/internal/middleware"
+	"github.com/spmt/monitoring/internal/model"
+	"github.com/spmt/monitoring/internal/service"
+	ws "github.com/spmt/monitoring/internal/websocket"
+	"github.com/spmt/monitoring/internal/worker"
+	"github.com/spmt/monitoring/internal/notification"
+	"time"
+)
+
+type Handler struct {
+	svc   *service.Service
+	pool  *worker.Pool
+	hub   *ws.Hub
+	notif *notification.Service
+}
+
+func New(svc *service.Service, pool *worker.Pool, hub *ws.Hub, notif *notification.Service) *Handler {
+	return &Handler{svc: svc, pool: pool, hub: hub, notif: notif}
+}
+
+func respond(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func respondError(w http.ResponseWriter, status int, msg string) {
+	respond(w, status, map[string]string{"error": msg})
+}
+
+// ─── AUTH ─────────────────────────────────────────────────────
+
+func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	var req model.LoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	resp, err := h.svc.Login(r.Context(), req)
+	if err != nil {
+		respondError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	// Write audit log for login
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = r.RemoteAddr
+	}
+	h.svc.WriteAuditLog(r.Context(), &model.AuditLog{
+		UserID:    &resp.User.ID,
+		Username:  resp.User.Username,
+		Action:    "LOGIN",
+		Target:    "self",
+		Details:   "User logged in successfully",
+		IPAddress: ip,
+	})
+
+	respond(w, http.StatusOK, resp)
+}
+
+
+// GoogleLogin verifies a Google ID token and either logs the user in (active
+// account → JWT) or self-registers them as a pending viewer awaiting admin
+// approval. It always returns 200 on a valid token; the body's Status/Token tells
+// the client what happened.
+func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
+	var req model.GoogleLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	resp, err := h.svc.LoginWithGoogle(r.Context(), req.Credential)
+	if err != nil {
+		respondError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	// Audit log only when an actual session is issued.
+	if resp.Token != "" && resp.User != nil {
+		ip := r.Header.Get("X-Forwarded-For")
+		if ip == "" {
+			ip = r.Header.Get("X-Real-IP")
+		}
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+		h.svc.WriteAuditLog(r.Context(), &model.AuditLog{
+			UserID:    &resp.User.ID,
+			Username:  resp.User.Username,
+			Action:    "LOGIN",
+			Target:    "self",
+			Details:   "User logged in successfully via Google",
+			IPAddress: ip,
+		})
+	}
+
+	respond(w, http.StatusOK, resp)
+}
+
+func (h *Handler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
+	var req model.UpdateProfileRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	userID := middleware.GetUserID(r.Context())
+	if userID == uuid.Nil {
+		respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := h.svc.UpdateProfile(r.Context(), userID, req); err != nil {
+		log.Printf("[Handler] UpdateProfile Error for User %s: %v", userID, err)
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respond(w, http.StatusOK, map[string]string{"message": "profile updated successfully"})
+}
+
+func (h *Handler) ChangePassword(w http.ResponseWriter, r *http.Request) {
+	var req model.ChangePasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	userID := middleware.GetUserID(r.Context())
+	if userID == uuid.Nil {
+		respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := h.svc.ChangePassword(r.Context(), userID, req); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, map[string]string{"message": "password changed successfully"})
+}
+
+func (h *Handler) TestEmail(w http.ResponseWriter, r *http.Request) {
+	log.Println("[Handler] TestEmail triggered")
+	userID := middleware.GetUserID(r.Context())
+	if userID == uuid.Nil {
+		respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := h.svc.SendTestEmail(r.Context(), userID, h.notif); err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respond(w, http.StatusOK, map[string]string{"message": "test email sent"})
+}
+
+// SendWeeklyReportNow triggers the weekly email report immediately (manual/testing).
+func (h *Handler) SendWeeklyReportNow(w http.ResponseWriter, r *http.Request) {
+	log.Println("[Handler] Manual weekly report triggered")
+	if err := h.notif.SendWeeklyReport(r.Context()); err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, map[string]string{"message": "weekly report sent"})
+}
+
+// ─── USERS ────────────────────────────────────────────────────
+
+func (h *Handler) GetUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := h.svc.GetAllUsers(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, users)
+}
+
+func (h *Handler) PromoteUser(w http.ResponseWriter, r *http.Request) {
+	var req model.PromoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.svc.PromoteUser(r.Context(), req); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.writeAuditLog(r, "PROMOTE_USER", req.UserID, "Promoted user to admin")
+
+	respond(w, http.StatusOK, map[string]string{"message": "user promoted to admin"})
+}
+
+func (h *Handler) DemoteUser(w http.ResponseWriter, r *http.Request) {
+	var req model.DemoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if err := h.svc.DemoteUser(r.Context(), req); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.writeAuditLog(r, "DEMOTE_USER", req.UserID, "Demoted user to viewer")
+
+	respond(w, http.StatusOK, map[string]string{"message": "user demoted to viewer"})
+}
+
+// ─── WEBSITES ────────────────────────────────────────────────
+
+func (h *Handler) GetWebsites(w http.ResponseWriter, r *http.Request) {
+	sites, err := h.svc.GetAllWebsites(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if sites == nil {
+		sites = []*model.Website{}
+	}
+	respond(w, http.StatusOK, sites)
+}
+
+func (h *Handler) GetPublicWebsites(w http.ResponseWriter, r *http.Request) {
+	sites, err := h.svc.GetAllWebsites(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// We return a simplified version for the public
+	type PublicSite struct {
+		ID             uuid.UUID       `json:"id"`
+		Name           string          `json:"name"`
+		URL            string          `json:"url"`
+		Status         model.LogStatus `json:"status"`
+		StatusCode     *int            `json:"status_code"`
+		ResponseTimeMs *int            `json:"response_time_ms"`
+		LastChecked    *time.Time      `json:"last_checked"`
+	}
+
+	publicSites := make([]PublicSite, 0)
+	for _, s := range sites {
+		status := model.StatusOffline
+		if s.Status != "" {
+			status = model.LogStatus(s.Status)
+		}
+		publicSites = append(publicSites, PublicSite{
+			ID:             s.ID,
+			Name:           s.Name,
+			URL:            s.URL,
+			Status:         status,
+			StatusCode:     s.StatusCode,
+			ResponseTimeMs: s.ResponseTimeMs,
+			LastChecked:    s.LastChecked,
+		})
+	}
+
+	respond(w, http.StatusOK, publicSites)
+}
+
+func (h *Handler) RecheckWebsites(w http.ResponseWriter, r *http.Request) {
+	log.Println("[Handler] Manual recheck triggered")
+	go h.pool.RevalidateAll()
+	respond(w, http.StatusOK, map[string]string{"message": "recheck triggered for all websites"})
+}
+
+func (h *Handler) CreateWebsite(w http.ResponseWriter, r *http.Request) {
+	var req model.CreateWebsiteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	site, err := h.svc.CreateWebsite(r.Context(), req)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Trigger immediate check and start ticker for new website
+	go h.pool.RestartWebsite(*site)
+
+	h.writeAuditLog(r, "CREATE_WEBSITE", site.ID.String(), "Created website: "+site.Name+" ("+site.URL+")")
+
+	respond(w, http.StatusCreated, site)
+}
+
+func (h *Handler) UpdateWebsite(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid website id")
+		return
+	}
+
+	var req model.UpdateWebsiteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	site, err := h.svc.UpdateWebsite(r.Context(), id, req)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// BUG FIX #10: restart worker agar monitoring pakai URL/config terbaru
+	go h.pool.RestartWebsite(*site)
+
+	h.writeAuditLog(r, "UPDATE_WEBSITE", site.ID.String(), "Updated website: "+site.Name+" ("+site.URL+")")
+
+	respond(w, http.StatusOK, site)
+}
+
+func (h *Handler) DeleteWebsite(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid website id")
+		return
+	}
+
+	if err := h.svc.DeleteWebsite(r.Context(), id); err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.writeAuditLog(r, "DELETE_WEBSITE", idStr, "Deleted website ID: "+idStr)
+
+	respond(w, http.StatusOK, map[string]string{"message": "website deleted"})
+}
+
+// BulkDeleteWebsites deletes several websites in one atomic transaction.
+func (h *Handler) BulkDeleteWebsites(w http.ResponseWriter, r *http.Request) {
+	var req model.BulkDeleteWebsitesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(req.IDs) == 0 {
+		respondError(w, http.StatusBadRequest, "no website ids provided")
+		return
+	}
+
+	deleted, err := h.svc.DeleteWebsites(r.Context(), req.IDs)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.writeAuditLog(r, "BULK_DELETE_WEBSITE", "", "Bulk deleted "+strconv.FormatInt(deleted, 10)+" website(s)")
+
+	respond(w, http.StatusOK, map[string]interface{}{"message": "websites deleted", "deleted": deleted})
+}
+
+func (h *Handler) GetWebsiteSLA(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid website id")
+		return
+	}
+
+	sla, err := h.svc.GetWebsiteSLA(r.Context(), id)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	respond(w, http.StatusOK, sla)
+}
+
+
+// ─── DASHBOARD ───────────────────────────────────────────────
+
+func (h *Handler) GetDashboardSummary(w http.ResponseWriter, r *http.Request) {
+	summary, err := h.svc.GetDashboardSummary(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, summary)
+}
+
+func (h *Handler) GetSystemHealth(w http.ResponseWriter, r *http.Request) {
+	respond(w, http.StatusOK, h.pool.GetHealth())
+}
+
+func (h *Handler) GetWebsiteLogs(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid website id")
+		return
+	}
+
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil {
+			limit = parsed
+		}
+	}
+
+	logs, err := h.svc.GetWebsiteLogs(r.Context(), id, limit)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if logs == nil {
+		logs = []*model.MonitoringLog{}
+	}
+	respond(w, http.StatusOK, logs)
+}
+
+
+// ─── WEBSOCKET ───────────────────────────────────────────────
+
+func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
+	h.hub.ServeWS(w, r)
+}
+
+// GetStatusHistory mengembalikan data historis status service untuk grafik
+func (h *Handler) GetStatusHistory(w http.ResponseWriter, r *http.Request) {
+	rangeStr := r.URL.Query().Get("range")
+	if rangeStr == "" {
+		rangeStr = "24h"
+	}
+	// Validasi input
+	switch rangeStr {
+	case "live", "1h", "3h", "6h", "24h", "7d":
+		// valid
+	default:
+		rangeStr = "24h"
+	}
+
+	points, err := h.svc.GetStatusHistory(r.Context(), rangeStr)
+	if err != nil {
+		respondError(w, 500, "failed to fetch history")
+		return
+	}
+	respond(w, 200, points)
+}
+
+// GetWebsiteEvents mengembalikan status_events untuk satu website
+func (h *Handler) GetWebsiteEvents(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "invalid website id")
+		return
+	}
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if limitStr != "" {
+		if v, err := strconv.Atoi(limitStr); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	events, err := h.svc.GetStatusEventsByWebsite(r.Context(), id, limit)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if events == nil {
+		events = []*model.StatusEvent{}
+	}
+	respond(w, http.StatusOK, events)
+}
+
+// GetAllStatusEvents mengembalikan semua status_events terbaru
+func (h *Handler) GetAllStatusEvents(w http.ResponseWriter, r *http.Request) {
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100
+	if limitStr != "" {
+		if v, err := strconv.Atoi(limitStr); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	events, err := h.svc.GetAllStatusEvents(r.Context(), limit)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if events == nil {
+		events = []*model.StatusEvent{}
+	}
+	respond(w, http.StatusOK, events)
+}
+
+// ─── USER MANAGEMENT (SUPERADMIN) ────────────────────────────
+
+// CreateUser — superadmin membuat user baru dengan role tertentu
+func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
+	var req model.CreateUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	user, err := h.svc.CreateUserByAdmin(r.Context(), req)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.writeAuditLog(r, "CREATE_USER", user.ID.String(), "Created user: "+user.Username+" with role "+string(user.Role))
+
+	respond(w, http.StatusCreated, user)
+}
+
+// GetPendingUserCount — jumlah registrasi yang menunggu konfirmasi admin.
+func (h *Handler) GetPendingUserCount(w http.ResponseWriter, r *http.Request) {
+	count, err := h.svc.GetPendingUserCount(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, map[string]int{"pending": count})
+}
+
+// ApproveUser — admin menyetujui registrasi user baru (jadi viewer aktif).
+func (h *Handler) ApproveUser(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	if err := h.svc.ApproveUser(r.Context(), idStr); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.writeAuditLog(r, "APPROVE_USER", idStr, "Approved registration for user ID: "+idStr)
+	respond(w, http.StatusOK, map[string]string{"message": "user approved"})
+}
+
+// RejectUser — admin menolak registrasi user baru (akun dihapus).
+func (h *Handler) RejectUser(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	if err := h.svc.RejectUser(r.Context(), idStr); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.writeAuditLog(r, "REJECT_USER", idStr, "Rejected registration for user ID: "+idStr)
+	respond(w, http.StatusOK, map[string]string{"message": "user rejected"})
+}
+
+// DeleteUser — superadmin hapus user
+func (h *Handler) DeleteUser(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	if err := h.svc.DeleteUser(r.Context(), idStr); err != nil {
+		respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	h.writeAuditLog(r, "DELETE_USER", idStr, "Deleted user ID: "+idStr)
+
+	respond(w, http.StatusOK, map[string]string{"message": "user deleted"})
+}
+
+// ─── NOTIFICATIONS ────────────────────────────────────────────
+
+// MarkAllNotificationsRead — tandai semua notifikasi sebagai dibaca
+func (h *Handler) MarkAllNotificationsRead(w http.ResponseWriter, r *http.Request) {
+	if err := h.svc.MarkAllNotificationsRead(r.Context()); err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, map[string]string{"message": "all notifications marked as read"})
+}
+
+// GetUnreadNotificationCount — jumlah notifikasi belum dibaca
+func (h *Handler) GetUnreadNotificationCount(w http.ResponseWriter, r *http.Request) {
+	count, err := h.svc.GetUnreadNotificationCount(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, map[string]int{"unread": count})
+}
+// ─── CHAOS SIMULATOR ──────────────────────────────────────────
+
+func (h *Handler) ToggleChaos(w http.ResponseWriter, r *http.Request) {
+	mode := r.URL.Query().Get("mode")
+	active := r.URL.Query().Get("active") == "true"
+	
+	validModes := map[string]bool{"slow": true, "loss": true, "dns": true, "ssl": true, "firewall": true, "timeout": true}
+	if !validModes[mode] {
+		respondError(w, http.StatusBadRequest, "invalid chaos mode")
+		return
+	}
+
+	h.pool.SetChaos(mode, active)
+	respond(w, http.StatusOK, map[string]interface{}{"mode": mode, "active": active})
+}
+
+func (h *Handler) GetStatusDistribution(w http.ResponseWriter, r *http.Request) {
+	dist, err := h.svc.GetStatusDistribution(r.Context())
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	respond(w, http.StatusOK, dist)
+}
+
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	h.writeAuditLog(r, "LOGOUT", "self", "User logged out successfully")
+	respond(w, http.StatusOK, map[string]string{"message": "logged out successfully"})
+}
+
+func (h *Handler) writeAuditLog(r *http.Request, action, target, details string) {
+	ctx := r.Context()
+	userID := middleware.GetUserID(ctx)
+	username := middleware.GetUsername(ctx)
+
+	var uID *uuid.UUID
+	if userID != uuid.Nil {
+		uID = &userID
+	}
+
+	ip := r.Header.Get("X-Forwarded-For")
+	if ip == "" {
+		ip = r.Header.Get("X-Real-IP")
+	}
+	if ip == "" {
+		ip = r.RemoteAddr
+	}
+
+	audit := &model.AuditLog{
+		UserID:    uID,
+		Username:  username,
+		Action:    action,
+		Target:    target,
+		Details:   details,
+		IPAddress: ip,
+	}
+
+	h.svc.WriteAuditLog(ctx, audit)
+}
+
+// GetTelegramLink returns the Telegram group invite link.
+func (h *Handler) GetTelegramLink(w http.ResponseWriter, r *http.Request) {
+	link := os.Getenv("TELEGRAM_GROUP_LINK")
+	if link == "" {
+		link = "https://t.me/spmt_monitoring_group"
+	}
+	respond(w, http.StatusOK, map[string]string{"link": link})
+}
+
+

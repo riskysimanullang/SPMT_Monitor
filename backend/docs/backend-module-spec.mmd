@@ -1,0 +1,45 @@
+flowchart TD
+  subgraph Startup
+    A[Load Config] --> B[Connect PostgreSQL]
+    B --> C[Init Repository Layer]
+    C --> D[Init Service Layer]
+    D --> E[Init Notification Service]
+    E --> F[Init WebSocket Hub]
+    F --> G[Init Worker Pool]
+    G --> H[Start HTTP Server]
+  end
+
+  subgraph HTTP Flow
+    H --> I[Router (Chi)]
+    I --> J[Middleware: Auth / CORS / Logging / Recovery]
+    J --> K[Handler Layer]
+    K --> L[Service Layer]
+    L --> M[Repository Layer]
+    L --> N[Notification Service]
+    L --> O[WebSocket Hub]
+    M --> DB[(PostgreSQL)]
+  end
+
+  subgraph Monitoring Flow
+    G --> P[Worker Pool]
+    P --> Q[Monitor Websites]
+    Q --> R[Write monitoring_logs]
+    R --> S[Evaluate status change]
+    S --> T[Insert status_events]
+    S --> U[Create/Update incidents]
+    U --> N
+    T --> N
+    U --> O
+    T --> O
+  end
+
+  subgraph Notifications
+    N --> V[Send Email/Telegram]
+    N --> W[Schedule Weekly Report]
+  end
+
+  click DB "../migrations/001_init.sql" "DB schema source"
+  click H "backend/cmd/server/main.go" "Entry point"
+  click K "backend/internal/handler/" "Handler layer"
+  click L "backend/internal/service/" "Service layer"
+  click M "backend/internal/repository/" "Repository layer"

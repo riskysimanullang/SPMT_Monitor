@@ -1,0 +1,32 @@
+flowchart LR
+  A[main.jsx] --> B[App.jsx]
+  B --> C[Pages]
+  C --> D[LoginPage]
+  C --> E[DashboardPage]
+  C --> F[WebsitesPage]
+  C --> G[UsersPage]
+  C --> H[ActivityLogPage]
+
+  E --> I[Components Dashboard]
+  F --> J[Components Common]
+  G --> J
+  H --> I
+
+  I --> K[StatusPanel]
+  I --> L[MonitoringGraph]
+  I --> M[ServiceDetailModal]
+  I --> N[NotificationBell]
+  I --> O[TopBar]
+
+  E --> P[WebSocketContext]
+  E --> Q[API Services]
+  Q --> R[Backend REST API]
+  P --> R
+  P --> S[Realtime Updates]
+  S --> E
+
+  B --> T[Store Auth]
+  B --> U[Store Theme]
+  B --> P
+
+  E --> V[Hooks & Utils]

@@ -1,0 +1,235 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spmt/monitoring/internal/config"
+	"github.com/spmt/monitoring/internal/handler"
+	"github.com/spmt/monitoring/internal/middleware"
+	"github.com/spmt/monitoring/internal/model"
+	"github.com/spmt/monitoring/internal/notification"
+	"github.com/spmt/monitoring/internal/repository"
+	"github.com/spmt/monitoring/internal/service"
+	ws "github.com/spmt/monitoring/internal/websocket"
+	"github.com/spmt/monitoring/internal/worker"
+)
+
+func main() {
+	// ─── Config ───────────────────────────────────────────────
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	// ─── Database ─────────────────────────────────────────────
+	connStr := fmt.Sprintf(
+		"postgres://%s:%s@%s:%s/%s?sslmode=%s&pool_max_conns=10&pool_max_conn_idle_time=10m",
+		cfg.DBUser, cfg.DBPassword, cfg.DBHost, cfg.DBPort, cfg.DBName, cfg.DBSSLMode,
+	)
+	pool, err := pgxpool.New(context.Background(), connStr)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(context.Background()); err != nil {
+		log.Fatalf("Database ping failed: %v", err)
+	}
+	log.Println("✅ Connected to PostgreSQL")
+
+	// Ensure the registration-approval column exists. Idempotent and cheap, so it
+	// runs on every boot — this lets a new binary work even if migration 018 was
+	// not applied manually first (existing rows default to 'active').
+	if _, err := pool.Exec(context.Background(), `
+		ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';
+		ALTER TABLE users DROP CONSTRAINT IF EXISTS users_status_check;
+		ALTER TABLE users ADD CONSTRAINT users_status_check CHECK (status IN ('pending', 'active', 'rejected'));
+		CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+	`); err != nil {
+		log.Printf("⚠️  Could not ensure users.status column: %v", err)
+	}
+
+	// ─── Layers ───────────────────────────────────────────────
+	repo := repository.New(pool)
+	svc := service.New(repo, cfg.JWTSecret, cfg.TurnstileSecret, cfg.GoogleClientID, cfg.JWTExpiryHours)
+	notif := notification.NewService(cfg, repo)
+	hub := ws.NewHub()
+	workerPool := worker.NewPool(repo, hub, notif, 10)
+
+	// ─── Network Monitoring ───────────────────────────────────
+	netSvc := service.NewNetworkService(hub, workerPool.RevalidateAll)
+	workerPool.SetNetworkReader(netSvc)
+	go netSvc.Start(context.Background())
+
+	// ─── Start services ───────────────────────────────────────
+	go hub.Run()
+	workerPool.Start()
+	notif.StartWeeklyReportScheduler(context.Background())
+	log.Println("✅ Worker pool started")
+	log.Println("✅ Network context monitoring started")
+	log.Println("✅ Weekly email report scheduler started")
+
+	// ─── Router ───────────────────────────────────────────────
+	h := handler.New(svc, workerPool, hub, notif)
+
+	r := chi.NewRouter()
+	r.Use(chimiddleware.Logger)
+	r.Use(chimiddleware.Recoverer)
+	r.Use(chimiddleware.RequestID)
+	r.Use(cors.Handler(cors.Options{
+		AllowOriginFunc: func(_ *http.Request, origin string) bool {
+			// Empty allowlist = dev mode: accept any origin (warned at startup).
+			if len(cfg.AllowedOrigins) == 0 {
+				return true
+			}
+			for _, allowed := range cfg.AllowedOrigins {
+				if allowed == "*" || strings.EqualFold(allowed, origin) {
+					return true
+				}
+			}
+			return false
+		},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
+	// Health check
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	r.Handle("/metrics", promhttp.Handler())
+
+	// Auth routes (public)
+	r.Post("/auth/login", h.Login)
+	r.Post("/auth/google", h.GoogleLogin)
+
+	// Public Status Route
+	r.Get("/public/websites", h.GetPublicWebsites)
+	r.Get("/public/telegram-link", h.GetTelegramLink)
+
+	// WebSocket (public - auth via query param or handled client-side)
+	r.Get("/ws", h.ServeWS)
+
+	// Protected routes
+	r.Group(func(r chi.Router) {
+		r.Use(middleware.Auth(cfg.JWTSecret))
+
+		r.Post("/auth/logout", h.Logout)
+
+		// Dashboard (all authenticated users)
+		r.Get("/dashboard/summary", h.GetDashboardSummary)
+		r.Get("/system/health", h.GetSystemHealth)
+		r.Get("/dashboard/history", h.GetStatusHistory)
+		r.Get("/websites/{id}/logs", h.GetWebsiteLogs)
+		r.Get("/websites/{id}/sla", h.GetWebsiteSLA)
+		r.Get("/websites/{id}/events", h.GetWebsiteEvents)
+		r.Get("/dashboard/events", h.GetAllStatusEvents)
+		r.Get("/websites", h.GetWebsites)
+		r.Post("/websites/recheck", h.RecheckWebsites)
+
+		// Incidents & Maintenance (all authenticated users)
+		r.Get("/incidents", h.GetIncidents)
+		r.Get("/incidents/{id}", h.GetIncident)
+		r.Get("/incidents/{id}/comments", h.GetIncidentComments)
+		r.Post("/incidents/{id}/comments", h.AddIncidentComment)
+		r.Get("/incidents/{id}/history", h.GetIncidentHistory)
+		r.Get("/maintenance-windows", h.GetMaintenanceWindows)
+
+		// Website management & Incident operations (admin + superadmin)
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RequireRole(model.RoleAdmin, model.RoleSuperAdmin))
+			r.Post("/websites", h.CreateWebsite)
+			r.Post("/websites/bulk-delete", h.BulkDeleteWebsites)
+			r.Put("/websites/{id}", h.UpdateWebsite)
+			r.Delete("/websites/{id}", h.DeleteWebsite)
+
+			// Incident actions
+			r.Post("/incidents/{id}/acknowledge", h.AcknowledgeIncident)
+			r.Post("/incidents/{id}/assign", h.AssignIncident)
+			r.Post("/incidents/{id}/resolve", h.ResolveIncident)
+			r.Post("/incidents/{id}/reopen", h.ReopenIncident)
+			r.Post("/incidents/{id}/close", h.CloseIncident)
+
+			// Maintenance windows actions
+			r.Post("/maintenance-windows", h.CreateMaintenanceWindow)
+			r.Delete("/maintenance-windows/{id}", h.DeleteMaintenanceWindow)
+		})
+
+		// Notifications (all authenticated users)
+		r.Get("/notifications/unread-count", h.GetUnreadNotificationCount)
+		r.Post("/notifications/mark-all-read", h.MarkAllNotificationsRead)
+		r.Put("/auth/profile", h.UpdateProfile)
+		r.Put("/auth/change-password", h.ChangePassword)
+		r.Post("/auth/test-email", h.TestEmail)
+
+		// User management (superadmin only)
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RequireRole(model.RoleSuperAdmin))
+			r.Get("/users", h.GetUsers)
+			r.Get("/users/pending-count", h.GetPendingUserCount)
+			r.Post("/users/promote", h.PromoteUser)
+			r.Post("/users/demote", h.DemoteUser)
+			r.Post("/users/create", h.CreateUser)
+			r.Post("/users/{id}/approve", h.ApproveUser)
+			r.Post("/users/{id}/reject", h.RejectUser)
+			r.Delete("/users/{id}", h.DeleteUser)
+		})
+
+		// System tools (superadmin only)
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RequireRole(model.RoleSuperAdmin))
+			r.Post("/chaos/toggle", h.ToggleChaos)
+			r.Post("/reports/weekly/send", h.SendWeeklyReportNow)
+		})
+		r.Get("/dashboard/distribution", h.GetStatusDistribution)
+	})
+
+	// ─── Server ───────────────────────────────────────────────
+	srv := &http.Server{
+		Addr:         "0.0.0.0:" + cfg.ServerPort,
+		Handler:      r,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("🚀 SPMT Monitoring Server running on :%s", cfg.ServerPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// ─── Graceful shutdown ────────────────────────────────────
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+	workerPool.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server shutdown failed: %v", err)
+	}
+	log.Println("Server stopped.")
+}

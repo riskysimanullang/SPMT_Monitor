@@ -1,0 +1,45 @@
+flowchart LR
+  subgraph Server Startup
+    A[Load Config] --> B[Connect PostgreSQL]
+    B --> C[Run DB Migration / Ensure Schema]
+    C --> D[Init Repository]
+    D --> E[Init Service Layer]
+    E --> F[Init Notification Service]
+    F --> G[Init WebSocket Hub]
+    G --> H[Start Worker Pool]
+    H --> I[Start HTTP Server]
+  end
+
+  subgraph HTTP API
+    I --> J[Router]
+    J --> K[Middleware: Auth, CORS, Logging]
+    K --> L[Handler Layer]
+    L --> M[Service Layer]
+    M --> N[Repository Layer]
+    M --> O[Notification Service]
+    M --> P[WebSocket Hub]
+    N --> DB[(PostgreSQL)]
+  end
+
+  subgraph Monitoring Engine
+    H --> Q[Worker Tasks]
+    Q --> R[DNS/TCP/HTTP/SSL Checks]
+    R --> S[Insert monitoring_logs]
+    S --> T[Evaluate Status Change]
+    T --> U[Insert status_events]
+    T --> V[Create/Update incidents]
+    V --> P
+    U --> P
+    P --> W[Broadcast update to frontend]
+  end
+
+  subgraph Notification Flow
+    O --> X[Email/Telegram]
+    V --> O
+    T --> O
+  end
+
+  style DB fill:#f9fafb,stroke:#cbd5e1
+  style P fill:#eef2ff,stroke:#93c5fd
+  style Q fill:#fcf8e8,stroke:#facc15
+  style O fill:#f0fdf4,stroke:#34d399

@@ -1,0 +1,51 @@
+# Database
+backend/spmt.db
+backend/spmt.db*
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+presentation/node_modules/
+
+# Go
+backend/spmt.exe
+backend/spmt
+backend/vendor/
+*.exe
+backend/tmp/
+backend/scratch/
+backend/.env
+
+# Dev scratch / diff dumps
+tmp/
+*_diff.txt
+git_diff*.txt
+
+# Docs build fallback (written when Word has DOCUMENTATION.docx locked)
+DOCUMENTATION-baru.docx
+
+# OS/Editor
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Personal Docs & Presentations
+DOCUMENTATION.docx
+DOCUMENTATION.html
+DOCUMENTATION.md
+PRESENTATION.html
+*.pptx
+*.docx
+presentation/*.pptx
+
+# Scripts, logs & presentation folder
+AGENTS.md
+SPMT.sh
+lo.ico
+start.bat
+presentation/
+
+
